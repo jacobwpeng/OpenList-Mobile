@@ -1,0 +1,140 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      openlist_version:
+        description: OpenList release tag
+        required: true
+        default: v4.2.6
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-ios-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ipa:
+    name: Compile OpenList core and unsigned IPA
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      OPENLIST_VERSION: ${{ inputs.openlist_version }}
+      COCOAPODS_DISABLE_STATS: 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Apple build tools
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          pod --version
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.27.x'
+          cache: false
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.32.7'
+          channel: stable
+          cache: true
+
+      - name: Prepare official core and frontend
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$OPENLIST_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]
+          CORE_SOURCE="$RUNNER_TEMP/openlist-source"
+          git clone --depth 1 --branch "$OPENLIST_VERSION" \
+            https://github.com/OpenListTeam/OpenList.git "$CORE_SOURCE"
+          echo "OPENLIST_GIT_COMMIT=$(git -C "$CORE_SOURCE" rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "OPENLIST_BUILT_AT=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> "$GITHUB_ENV"
+          cp -R "$CORE_SOURCE"/. openlist-lib/
+          gh api repos/OpenListTeam/OpenList-Frontend/releases/latest > "$RUNNER_TEMP/frontend-release.json"
+          FRONTEND_VERSION=$(jq -r .tag_name "$RUNNER_TEMP/frontend-release.json")
+          FRONTEND_URL=$(jq -er '.assets[] | select(.name | startswith("openlist-frontend-dist")) | select(.name | contains("lite") | not) | select(.name | endswith(".tar.gz")) | .browser_download_url' "$RUNNER_TEMP/frontend-release.json")
+          echo "OPENLIST_WEB_VERSION=$FRONTEND_VERSION" >> "$GITHUB_ENV"
+          mkdir -p openlist-lib/public/dist
+          curl -fL --retry 3 --max-time 180 "$FRONTEND_URL" -o "$RUNNER_TEMP/frontend.tar.gz"
+          tar -xzf "$RUNNER_TEMP/frontend.tar.gz" -C openlist-lib/public/dist
+          test -f openlist-lib/public/dist/index.html
+          cd openlist-lib
+          go mod edit -replace github.com/djherbis/times@v1.6.0=github.com/jing332/times@latest
+
+      - name: Build official OpenList iOS framework
+        run: |
+          set -euo pipefail
+          cd openlist-lib/scripts
+          chmod +x ./*.sh
+          bash -euo pipefail ./init_gomobile.sh
+          bash -euo pipefail ./gobind_ios.sh
+          test -d "$GITHUB_WORKSPACE/ios/Frameworks/Openlistlib.xcframework"
+
+      - name: Build iPhone and iPad app without signing
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter build ios --release --no-codesign \
+            --build-name "${OPENLIST_VERSION#v}" \
+            --build-number "$GITHUB_RUN_NUMBER" 2>&1 | tee "$RUNNER_TEMP/flutter-ios.log"
+
+      - name: Verify core and package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="$GITHUB_WORKSPACE/build/ios/iphoneos/Runner.app"
+          test -d "$APP_PATH"
+          APP_PATH="$APP_PATH" python3 - <<'PY'
+          import os, pathlib, plistlib
+          app = pathlib.Path(os.environ['APP_PATH'])
+          info = plistlib.loads((app / 'Info.plist').read_bytes())
+          assert 2 in info['UIDeviceFamily'], 'iPad support missing'
+          executable = app / info['CFBundleExecutable']
+          assert b'github.com/OpenListTeam/OpenList' in executable.read_bytes(), 'OpenList core missing from executable'
+          assert not (app / 'embedded.mobileprovision').exists(), 'Unexpected provisioning profile'
+          print({key: info.get(key) for key in ['CFBundleIdentifier', 'CFBundleShortVersionString', 'CFBundleVersion', 'MinimumOSVersion', 'UIDeviceFamily']})
+          PY
+          if codesign --verify "$APP_PATH" 2>/dev/null; then
+            echo 'Unexpected signed app; unsigned IPA requested.'
+            exit 1
+          fi
+          PACKAGE_DIR="$RUNNER_TEMP/unsigned-ipa"
+          mkdir -p "$PACKAGE_DIR/Payload" "$GITHUB_WORKSPACE/build/unsigned"
+          cp -R "$APP_PATH" "$PACKAGE_DIR/Payload/"
+          IPA_NAME="OpenList-Mobile-${OPENLIST_VERSION}-unsigned.ipa"
+          (cd "$PACKAGE_DIR" && zip -qry "$GITHUB_WORKSPACE/build/unsigned/$IPA_NAME" Payload)
+          cd build/unsigned
+          shasum -a 256 "$IPA_NAME" > "$IPA_NAME.sha256"
+          {
+            echo "### Unsigned iPhone / iPad IPA"
+            echo "- OpenList core: $OPENLIST_VERSION ($OPENLIST_GIT_COMMIT)"
+            echo "- Frontend: $OPENLIST_WEB_VERSION"
+            echo "- Download the artifact below and sign the IPA with your own certificate."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenList-Mobile-${{ inputs.openlist_version }}-unsigned
+          path: build/unsigned/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-ios-build-logs
+          path: |
+            ${{ runner.temp }}/flutter-ios.log
+            openlist-lib/ios_build*.log
+            ios/Podfile.lock
+          if-no-files-found: ignore
