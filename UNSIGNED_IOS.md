@@ -3,6 +3,7 @@
 This fork adds `.github/workflows/unsigned-ios.yaml` to the official
 OpenList-Mobile application. It builds the official OpenList core and the iOS
 app together on a GitHub-hosted macOS runner, without signing credentials.
+The app requires iOS / iPadOS 13.0 or later, matching the Go mobile framework.
 
 1. Open **Actions → Build unsigned iOS IPA → Run workflow**.
 2. Select the OpenList release tag (the default is `v4.2.6`).
